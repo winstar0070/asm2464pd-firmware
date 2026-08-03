@@ -529,6 +529,7 @@ static void u4lb_save_b402_clr(void) {  /* e84d */
 
 static void u4lb_pcie_tunnel_pwron(void) {  /* e76b */
   uint8_t gate = u4lb_p1_desc_query(0x04);
+  uart_puts("[TPwr "); uart_puthex(gate); uart_puts("]");
   if (gate != 0) {
     uint8_t v;
     u4lb_save_b402_clr();
@@ -537,8 +538,10 @@ static void u4lb_pcie_tunnel_pwron(void) {  /* e76b */
     phy_cc10_cmd_wait(1, 0, 0xCF);
     u4lb_p1_7104_set40();
     if (!(REG_PCIE_LANE_CTRL_C659 & 0x01)) {
-      REG_PCIE_LANE_CTRL_C659 = (uint8_t)(REG_PCIE_CTRL_B402 & 0xFE);
-      REG_PCIE_LANE_CTRL_C659 = (uint8_t)((REG_PCIE_CTRL_B402 & 0xFE) | 0x01);
+      /* Preserve C659 lane/power bits. Copying B402 bridge-control bits into
+       * this register can corrupt tunneled-link training. */
+      REG_PCIE_LANE_CTRL_C659 = (uint8_t)(REG_PCIE_LANE_CTRL_C659 & 0xFE);
+      REG_PCIE_LANE_CTRL_C659 = (uint8_t)(REG_PCIE_LANE_CTRL_C659 | 0x01);
     }
     if (u4_boot.pcie_ctrl_shadow) u4_boot.pcie_ctrl_shadow = (uint8_t)((REG_PCIE_CTRL_B402 & 0xFD) | 0x02);
   }
@@ -597,12 +600,23 @@ static void u4lb_link_phy_reconfig(void) {  /* d90e */
   u4lb_pcie_tunnel_arm();
 }
 
+static __xdata uint8_t u4lb_tev_last;
+
 static void u4lb_tunnel_event_dispatch(uint8_t assert) {  /* d855 */
   uint8_t p1508 = P1_RD(P1_USB4_TUNNEL_EVENT_STATUS_1508);
+  /* Log only changes so diagnostics do not flood the timing-sensitive UART. */
+  if (p1508 != u4lb_tev_last) {
+    uart_puts("[TEV "); uart_puthex(p1508); uart_puts(" LT "); uart_puthex(REG_PCIE_LTSSM_STATE); uart_puts("]");
+    u4lb_tev_last = p1508;
+  }
+  /* Event bits are W1C. A gated handler must not leave a bit pending because
+   * that blocks this else-if chain and can cause an interrupt storm. */
   if (p1508 & 0x10) {
-    if (u4_cfg.route_mode & 0x81) { P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, 0x10); u4lb_pcie_link_enable(); }
+    P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, 0x10);
+    if (u4_cfg.route_mode & 0x85) u4lb_pcie_link_enable();
   } else if (p1508 & 0x08) {
-    if (u4_cfg.route_mode & 0x81) { P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, 0x08); u4lb_pcie_tunnel_pwroff(); }
+    P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, 0x08);
+    if (u4_cfg.route_mode & 0x85) u4lb_pcie_tunnel_pwroff();
   } else if (p1508 & 0x04) {
     P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, 0x04);
     u4lb_pcie_tunnel_pwron();
@@ -617,6 +631,9 @@ static void u4lb_tunnel_event_dispatch(uint8_t assert) {  /* d855 */
       phy_cc10_cmd_wait(1, 0, 0xCF);
       REG_PCIE_CTRL_B402 = (uint8_t)(REG_PCIE_CTRL_B402 & 0xFE);
     }
+  } else if (p1508) {
+    /* Clear unknown event bits so the dispatcher can make forward progress. */
+    P1_WR(P1_USB4_TUNNEL_EVENT_STATUS_1508, p1508);
   }
 }
 
